@@ -37,11 +37,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# extra_form_data override targets that the query object actually reads. Note
+# that ``time_grain`` is deliberately absent: the query object has no such field
+# and nothing downstream consumes it, matching the REST path, where
+# form_data_query_context reads only ``time_grain_sqla``. Listing it here would
+# write a key that ChartDataQueryObjectSchema (``unknown = EXCLUDE``) discards.
 QUERY_CONTEXT_EXTRA_FORM_DATA_OVERRIDE_KEYS = {
     "granularity",
-    "time_grain",
     "time_grain_sqla",
     "time_range",
+}
+
+# Of the keys above, these are not query object fields: the query object carries
+# the time grain inside ``extras`` (see ChartDataExtrasSchema), mirroring how
+# form_data is translated in superset.common.form_data_query_context. Writing
+# them at the top level instead means ChartDataQueryObjectSchema, which is
+# configured with ``unknown = EXCLUDE``, silently drops the override.
+QUERY_CONTEXT_EXTRA_FORM_DATA_EXTRAS_KEYS = {
+    "time_grain_sqla",
 }
 
 
@@ -249,7 +262,10 @@ def merge_form_data_filters_into_query(
             and key in form_data
             and form_data[key] is not None
         ):
-            query[key] = form_data[key]
+            if key in QUERY_CONTEXT_EXTRA_FORM_DATA_EXTRAS_KEYS:
+                query["extras"] = {**(query.get("extras") or {}), key: form_data[key]}
+            else:
+                query[key] = form_data[key]
 
     for clause in ("where", "having"):
         if additional_clause := form_data.get(clause):
@@ -489,6 +505,13 @@ def _build_single_query_dict(
         qd["row_limit"] = effective_row_limit
     if order_desc is not None:
         qd["order_desc"] = order_desc
+    # sort_by_metric charts (pie/funnel/treemap/sankey/gauge) order by the
+    # metric descending. buildQuery derives this on the frontend; the MCP path
+    # builds the query dict directly and never reads a top-level
+    # form_data['orderby'], so translate the flag here or a row_limit truncates
+    # an unordered result (dropping the heaviest rows rather than the top-N).
+    if form_data.get("sort_by_metric") and metrics:
+        qd["orderby"] = [(metrics[0], False)]
     apply_form_data_filters_to_query(qd, form_data)
     return qd
 

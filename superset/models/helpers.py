@@ -114,6 +114,7 @@ from superset.exceptions import (
 )
 from superset.extensions import feature_flag_manager
 from superset.jinja_context import BaseTemplateProcessor
+from superset.sql.metric_normalization import normalize_custom_metric
 from superset.sql.parse import has_aggregate, sanitize_clause, SQLScript, SQLStatement
 from superset.superset_typing import (
     AdhocColumn,
@@ -196,6 +197,56 @@ def get_effective_hours_offset(
 
 # Right suffix used for joining offset results
 R_SUFFIX = "__right_suffix"
+
+
+# Escape character for LIKE patterns built from user-supplied search text.
+# Deliberately not a backslash: dialects that escape backslashes when rendering
+# string literals would emit a two-character ESCAPE clause, which is a syntax
+# error on engines that honour standard-conforming strings.
+LIKE_ESCAPE_CHAR = "!"
+
+
+def escape_like_pattern(value: str) -> str:
+    """
+    Neutralize LIKE wildcards in user-supplied search text.
+
+    Without this a user typing ``%`` or ``_`` would match every row, which is
+    both wrong and, on a large table, a scan the search was meant to avoid.
+    """
+    return (
+        value.replace(LIKE_ESCAPE_CHAR, LIKE_ESCAPE_CHAR * 2)
+        .replace("%", f"{LIKE_ESCAPE_CHAR}%")
+        .replace("_", f"{LIKE_ESCAPE_CHAR}_")
+    )
+
+
+def build_like_predicate(
+    expr: ColumnElement[Any],
+    search: str,
+) -> ColumnElement[Any]:
+    """
+    Build a case-insensitive containment predicate for ``expr``.
+
+    ``lower(expr) LIKE lower('%term%')`` is used rather than ``ILIKE`` because
+    the latter is not portable across engines.
+    """
+    pattern = f"%{escape_like_pattern(search)}%".lower()
+    return sa.func.lower(expr).like(pattern, escape=LIKE_ESCAPE_CHAR)
+
+
+def _is_parenthesized(sqla_col: ColumnElement) -> bool:
+    """
+    Return ``True`` when ``sqla_col`` is already wrapped in a ``Grouping``.
+
+    Calculated columns are parenthesized at the converter level
+    (``Grouping(literal_column(...))``), optionally behind a ``Label``. This
+    guards the filter-loop wrap below from adding a redundant second
+    ``Grouping`` (``((expr))``) for adhoc columns that reference a saved
+    calculated column.
+    """
+    return isinstance(sqla_col, Grouping) or (
+        isinstance(sqla_col, Label) and isinstance(sqla_col.element, Grouping)
+    )
 
 
 def _normalize_mssql_virtual_dataset_sql(
@@ -1293,6 +1344,15 @@ class AuditMixinNullable(AuditMixin):
 _NO_BYPASS: frozenset[type] = frozenset()
 
 
+@dataclasses.dataclass(frozen=True)
+class SqlExpressionContext:
+    """Database context required to validate and render a SQL expression."""
+
+    engine: str
+    schema: str
+    template_processor: BaseTemplateProcessor | None
+
+
 class SoftDeleteMixin:
     """Mixin that adds soft-delete support to a SQLAlchemy model.
 
@@ -1611,16 +1671,28 @@ class ExtraJSONMixin:
         return value
 
 
+_EXTRA_DICT_CACHE_UNSET = object()
+
+
 class CertificationMixin:
     """Mixin to add extra certification fields"""
 
     extra = sa.Column(sa.Text, default="{}")
 
     def get_extra_dict(self) -> dict[str, Any]:
-        try:
-            return json.loads(self.extra)
-        except (TypeError, json.JSONDecodeError):
-            return {}
+        # Cache the parsed ``extra`` payload on the instance, keyed by the raw
+        # string it was parsed from, so callers reading multiple
+        # certification/warning properties off the same object don't each
+        # trigger their own ``json.loads``. The cache is transient (not a
+        # mapped column) and self-invalidates whenever ``extra`` changes.
+        cache_raw = getattr(self, "_extra_dict_cache_raw", _EXTRA_DICT_CACHE_UNSET)
+        if cache_raw is _EXTRA_DICT_CACHE_UNSET or cache_raw != self.extra:
+            try:
+                self._extra_dict_cache = json.loads(self.extra)
+            except (TypeError, json.JSONDecodeError):
+                self._extra_dict_cache = {}
+            self._extra_dict_cache_raw = self.extra
+        return self._extra_dict_cache
 
     @property
     def is_certified(self) -> bool:
@@ -1845,28 +1917,70 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             )
         return self._denylist_default_schema
 
-    def _process_sql_expression(  # pylint: disable=too-many-arguments
+    def _process_sql_expression(
         self,
         expression: Optional[str],
-        database_id: int,
-        engine: str,
-        schema: str,
-        template_processor: Optional[BaseTemplateProcessor],
+        context: SqlExpressionContext,
     ) -> Optional[str]:
-        if template_processor and expression:
-            expression = template_processor.process_template(expression)
+        return self._process_validated_sql_expression(expression, context)
+
+    def _process_metric_sql_expression(
+        self,
+        expression: Optional[str],
+        context: SqlExpressionContext,
+    ) -> Optional[str]:
+        if context.template_processor and expression:
+            expression = context.template_processor.process_template(expression)
+        if not expression:
+            return expression
+
+        expression = validate_adhoc_subquery(
+            expression,
+            self.database,
+            self.catalog,
+            context.schema,
+            context.engine,
+        )
+        normalized_metric = normalize_custom_metric(
+            expression,
+            context.engine,
+            self.database.db_engine_spec,
+        )
+        return self._process_validated_sql_expression(
+            normalized_metric.expression,
+            context,
+            preserve_source=normalized_metric.may_preserve_source,
+            render_template=False,
+            validate_subquery=False,
+        )
+
+    def _process_validated_sql_expression(  # noqa: C901
+        self,
+        expression: Optional[str],
+        context: SqlExpressionContext,
+        *,
+        preserve_source: bool = False,
+        render_template: bool = True,
+        validate_subquery: bool = True,
+    ) -> Optional[str]:
+        if render_template and context.template_processor and expression:
+            expression = context.template_processor.process_template(expression)
         if expression:
-            expression = validate_adhoc_subquery(
-                expression,
-                self.database,
-                self.catalog,
-                schema,
-                engine,
-            )
+            if validate_subquery:
+                expression = validate_adhoc_subquery(
+                    expression,
+                    self.database,
+                    self.catalog,
+                    context.schema,
+                    context.engine,
+                )
+            source_expression = expression
             try:
-                expression = sanitize_clause(expression, engine)
+                expression = sanitize_clause(expression, context.engine)
             except QueryClauseValidationException as ex:
                 raise QueryObjectValidationError(ex.message) from ex
+            if preserve_source:
+                expression = source_expression.rstrip().rstrip(";").rstrip()
             # Adhoc expressions are user-controlled SQL that ends up inside a
             # `literal_column(...)`. Apply the operator-configured
             # `DISALLOWED_SQL_FUNCTIONS` / `DISALLOWED_SQL_TABLES` gates at the
@@ -1876,9 +1990,11 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             # the same gate applied at query-execution time and gives the
             # adhoc-expression path defense in depth.
             disallowed_functions = app.config["DISALLOWED_SQL_FUNCTIONS"].get(
-                engine, set()
+                context.engine, set()
             )
-            disallowed_tables = app.config["DISALLOWED_SQL_TABLES"].get(engine, set())
+            disallowed_tables = app.config["DISALLOWED_SQL_TABLES"].get(
+                context.engine, set()
+            )
             if disallowed_functions or disallowed_tables:
                 # `_process_select_expression` (and siblings) pre-wraps the
                 # input with `SELECT ...`; other callers pass bare
@@ -1889,7 +2005,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     if expression.strip().upper().startswith("SELECT")
                     else f"SELECT {expression}"
                 )
-                parsed = SQLScript(sql_to_check, engine=engine)
+                parsed = SQLScript(sql_to_check, engine=context.engine)
                 if disallowed_functions and parsed.check_functions_present(
                     disallowed_functions
                 ):
@@ -1916,7 +2032,6 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
     def _process_select_expression(
         self,
         expression: Optional[str],
-        database_id: int,
         engine: str,
         schema: str,
         template_processor: Optional[BaseTemplateProcessor],
@@ -1930,14 +2045,9 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         if expression:
             expression = f"SELECT {expression}"
 
-        if processed := self._process_sql_expression(
-            expression=expression,
-            database_id=database_id,
-            engine=engine,
-            schema=schema,
-            template_processor=template_processor,
-        ):
-            prefix, expression = re.split(
+        context = SqlExpressionContext(engine, schema, template_processor)
+        if processed := self._process_sql_expression(expression, context):
+            _prefix, expression = re.split(
                 r"SELECT\s+",
                 processed,
                 maxsplit=1,
@@ -1947,10 +2057,31 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
 
         return None
 
+    def _process_metric_select_expression(
+        self,
+        expression: Optional[str],
+        engine: str,
+        schema: str,
+        template_processor: Optional[BaseTemplateProcessor],
+    ) -> Optional[str]:
+        """Validate and normalize an ad hoc metric used in SELECT."""
+        if expression:
+            expression = f"SELECT {expression}"
+
+        context = SqlExpressionContext(engine, schema, template_processor)
+        if processed := self._process_metric_sql_expression(expression, context):
+            _prefix, expression = re.split(
+                r"SELECT\s+",
+                processed,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )
+            return expression.strip()
+        return None
+
     def _process_orderby_expression(
         self,
         expression: Optional[str],
-        database_id: int,
         engine: str,
         schema: str,
         template_processor: Optional[BaseTemplateProcessor],
@@ -1964,14 +2095,9 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         if expression:
             expression = f"SELECT 1 ORDER BY {expression}"
 
-        if processed := self._process_sql_expression(
-            expression=expression,
-            database_id=database_id,
-            engine=engine,
-            schema=schema,
-            template_processor=template_processor,
-        ):
-            prefix, expression = re.split(
+        context = SqlExpressionContext(engine, schema, template_processor)
+        if processed := self._process_sql_expression(expression, context):
+            _prefix, expression = re.split(
                 r"ORDER\s+BY",
                 processed,
                 maxsplit=1,
@@ -1979,6 +2105,28 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             )
             return expression.strip()
 
+        return None
+
+    def _process_metric_orderby_expression(
+        self,
+        expression: Optional[str],
+        engine: str,
+        schema: str,
+        template_processor: Optional[BaseTemplateProcessor],
+    ) -> Optional[str]:
+        """Validate and normalize an ad hoc metric used in ORDER BY."""
+        if expression:
+            expression = f"SELECT 1 ORDER BY {expression}"
+
+        context = SqlExpressionContext(engine, schema, template_processor)
+        if processed := self._process_metric_sql_expression(expression, context):
+            _prefix, expression = re.split(
+                r"ORDER\s+BY",
+                processed,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )
+            return expression.strip()
         return None
 
     def make_sqla_column_compatible(
@@ -3563,7 +3711,12 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             aggregate: Any = metric.get("aggregate")
             metric_column = metric.get("column") or {}
             column_name = cast(str, metric_column.get("column_name"))
-            sqla_column = sa.column(column_name)
+            sqla_column = sa.column(
+                self.db_engine_spec.prepare_identifier(
+                    column_name,
+                    normalize_columns=bool(self.normalize_columns),
+                )
+            )
 
             if isinstance(aggregate, str) and aggregate in self.sqla_aggregations:
                 sqla_metric = self.sqla_aggregations[aggregate](sqla_column)
@@ -3593,9 +3746,8 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 )
 
             if not processed:
-                expression = self._process_select_expression(
+                expression = self._process_metric_select_expression(
                     expression=expression,
-                    database_id=self.database_id,
                     engine=self.database.backend,
                     schema=self.schema,
                     template_processor=template_processor,
@@ -3721,7 +3873,11 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
     ) -> Column:
         if utils.is_adhoc_metric(series_limit_metric):
             assert isinstance(series_limit_metric, dict)
-            ob = self.adhoc_metric_to_sqla(series_limit_metric, columns_by_name)
+            ob = self.adhoc_metric_to_sqla(
+                series_limit_metric,
+                columns_by_name,
+                template_processor=template_processor,
+            )
         elif (
             isinstance(series_limit_metric, str)
             and series_limit_metric in metrics_by_name
@@ -4010,6 +4166,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         limit: int = 10000,
         denormalize_column: bool = False,
         array_elements: bool = False,
+        search: str | None = None,
     ) -> list[Any]:
         # denormalize column name before querying for values
         # unless disabled in the dataset configuration
@@ -4047,6 +4204,9 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             .select_from(tbl)
             .distinct()
         )
+        if search:
+            qry = qry.where(build_like_predicate(value_expr, search))
+
         if limit:
             qry = qry.limit(limit)
 
@@ -4267,9 +4427,22 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                         expression, self.database, self.catalog, self.schema
                     )
             expression = self._validate_stored_expression(expression)
-            col = literal_column(expression, type_=type_)
+            if "--" in expression or "#" in expression:
+                # A trailing single-line comment (``--``/``#``) would otherwise
+                # let Grouping's closing paren be swallowed by the comment
+                # (``(... -- x)`` -> unclosed paren); emit it on a new line.
+                expression = f"{expression}\n"
+            # Parenthesize calculated-column expressions so a bare boolean
+            # operator (e.g. OR) inside the expression cannot leak into the
+            # surrounding operator precedence when the column is used in a
+            # SELECT/GROUP BY/ORDER BY, series-limit prequery, or JOIN ON.
+            col = Grouping(literal_column(expression, type_=type_))
         else:
-            col = sa.column(tbl_column.column_name, type_=type_)
+            identifier = db_engine_spec.prepare_identifier(
+                cast(str, tbl_column.column_name),
+                normalize_columns=bool(self.normalize_columns),
+            )
+            col = sa.column(identifier, type_=type_)
         col = self.make_sqla_column_compatible(col, label)
         return col
 
@@ -4427,9 +4600,8 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 # back would change the cache key of a rehydrated query context
                 col = cast(AdhocMetric, dict(col))
                 if col.get("sqlExpression"):
-                    col["sqlExpression"] = self._process_orderby_expression(
+                    col["sqlExpression"] = self._process_metric_orderby_expression(
                         expression=col["sqlExpression"],
-                        database_id=self.database_id,
                         engine=self.database.backend,
                         schema=self.schema,
                         template_processor=template_processor,
@@ -4511,7 +4683,6 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     else:
                         selected = self._process_select_expression(
                             expression=selected,
-                            database_id=self.database_id,
                             engine=self.database.backend,
                             schema=self.schema,
                             template_processor=template_processor,
@@ -4572,7 +4743,6 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 if isinstance(selected, str):
                     selected = self._process_select_expression(
                         expression=quote(selected),
-                        database_id=self.database_id,
                         engine=self.database.backend,
                         schema=self.schema,
                         template_processor=template_processor,
@@ -4736,6 +4906,10 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             is_metric_filter = (
                 False  # Track if this is a filter on a metric (needs HAVING clause)
             )
+            # Track whether ``sqla_col`` was built from an adhoc expression
+            # (inline dict or referenced by label), so it can be parenthesized
+            # to guard operator precedence regardless of how it was referenced.
+            is_adhoc_sqla_col = False
             if flt_col == utils.DTTM_ALIAS and is_timeseries and dttm_col:
                 col_obj = dttm_col
             elif is_adhoc_column(flt_col):
@@ -4746,6 +4920,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                         template_processor=template_processor,
                     )
                     applied_adhoc_filters_columns.append(flt_col)
+                    is_adhoc_sqla_col = True
                 except ColumnNotFoundException:
                     rejected_adhoc_filters_columns.append(flt_col)
                     continue
@@ -4772,6 +4947,19 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                         template_processor=template_processor
                     )
                     is_metric_filter = True
+                elif (
+                    col_obj is None
+                    and isinstance(flt_col, str)
+                    and flt_col in adhoc_columns_by_label
+                ):
+                    sqla_col, _unused = self.adhoc_column_to_sqla(
+                        col=adhoc_columns_by_label[flt_col],
+                        template_processor=template_processor,
+                    )
+                    if isinstance(sqla_col, ColumnElement):
+                        applied_adhoc_filters_columns.append(flt_col)
+                        is_adhoc_sqla_col = True
+
             filter_grain = flt.get("grain")
 
             # Check if this filter should be skipped because it was handled in
@@ -4805,12 +4993,19 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     sqla_col = self.convert_tbl_column_to_sqla_col(
                         tbl_column=col_obj, template_processor=template_processor
                     )
-                # Parenthesize expression-based columns to prevent operator
-                # precedence issues (e.g. OR in a calculated column breaking
-                # surrounding AND filters). Same pattern as extras.where
-                # wrapping added in PR #38183.
-                if sqla_col is not None and (
-                    (col_obj and col_obj.expression) or is_adhoc_column(flt_col)
+                # Parenthesize adhoc SQL-expression columns (referenced inline
+                # or by label) to prevent operator-precedence issues (e.g. an OR
+                # in the expression breaking surrounding AND filters). Same
+                # pattern as the extras.where wrapping added in PR #38183.
+                # Registered calculated columns are already parenthesized by the
+                # converters (convert_tbl_column_to_sqla_col / get_sqla_col), so
+                # they no longer need wrapping here; the _is_parenthesized guard
+                # avoids a redundant double-wrap for adhoc columns that reference
+                # a saved calculated column.
+                if (
+                    sqla_col is not None
+                    and is_adhoc_sqla_col
+                    and not _is_parenthesized(sqla_col)
                 ):
                     sqla_col = Grouping(sqla_col)
                 col_type = col_obj.type if col_obj else None
@@ -5146,7 +5341,6 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             if where:
                 where = self._process_select_expression(
                     expression=where,
-                    database_id=self.database_id,
                     engine=self.database.backend,
                     schema=self.schema,
                     template_processor=template_processor,
@@ -5156,7 +5350,6 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             if having:
                 having = self._process_select_expression(
                     expression=having,
-                    database_id=self.database_id,
                     engine=self.database.backend,
                     schema=self.schema,
                     template_processor=template_processor,
